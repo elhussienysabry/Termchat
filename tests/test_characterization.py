@@ -13,11 +13,11 @@ class TestServerCharacterization(unittest.TestCase):
         self.bound_port = s.getsockname()[1]
         s.close()
 
-        server.HOST = "127.0.0.1"
-        server.PORT = self.bound_port
-        server.clients.clear()
+        config = server.ServerConfig(host="127.0.0.1", port=self.bound_port)
+        self.chat_server = server.ChatServer(config)
+        self.chat_server.start()
         
-        self.server_thread = threading.Thread(target=server.run_server, daemon=True)
+        self.server_thread = threading.Thread(target=self.chat_server.serve_forever, daemon=True)
         self.server_thread.start()
         
         # Wait for server to start listening by trying to connect
@@ -45,9 +45,8 @@ class TestServerCharacterization(unittest.TestCase):
             except OSError:
                 pass
                 
-        # Wait for threads to close. Since run_server loop runs indefinitely and we have no way to stop it cleanly in current code, 
-        # we just clear the clients and let daemon threads die at exit, but wait a bit to avoid interference.
-        server.clients.clear()
+        self.chat_server.shutdown()
+        self.server_thread.join(timeout=1.0)
         time.sleep(0.1)
 
     def create_client(self):
@@ -138,14 +137,70 @@ class TestServerCharacterization(unittest.TestCase):
         c1.sendall(b"Alice\n")
         self._read_until(c1, "Start chatting!")
 
-        self.assertEqual(len(server.clients), 1)
+        self.assertEqual(self.chat_server.active_count(), 1)
         c1.close()
         
         timeout = time.time() + 2
-        while len(server.clients) > 0 and time.time() < timeout:
+        while self.chat_server.active_count() > 0 and time.time() < timeout:
             time.sleep(0.05)
             
-        self.assertEqual(len(server.clients), 0)
+        self.assertEqual(self.chat_server.active_count(), 0)
+
+    def test_shutdown_closes_listener(self):
+        self.chat_server.shutdown()
+        # Ensure we cannot connect anymore
+        with self.assertRaises((ConnectionRefusedError, OSError)):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            sock.connect(("127.0.0.1", self.bound_port))
+
+    def test_shutdown_closes_active_sessions(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+        
+        self.chat_server.shutdown()
+        
+        # the client should eventually get disconnected
+        with self.assertRaises(Exception):
+            self._read_until(c1, "should not receive this")
+
+    def test_shutdown_safe_multiple_times(self):
+        self.chat_server.shutdown()
+        self.chat_server.shutdown() # Should not raise
+
+    def test_multiple_independent_servers(self):
+        # find another port
+        s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s2.bind(("127.0.0.1", 0))
+        port2 = s2.getsockname()[1]
+        s2.close()
+
+        config2 = server.ServerConfig(host="127.0.0.1", port=port2)
+        server2 = server.ChatServer(config2)
+        server2.start()
+        
+        t2 = threading.Thread(target=server2.serve_forever, daemon=True)
+        t2.start()
+
+        # Connect Alice to server 1
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        # Connect Alice to server 2 (should succeed because it's a different server)
+        c2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        c2.settimeout(1.0)
+        c2.connect(("127.0.0.1", port2))
+        self.client_sockets.append(c2)
+        self._read_until(c2, "Enter your nickname: ")
+        
+        c2.sendall(b"Alice\n")
+        resp = self._read_until(c2, "Start chatting!")
+        self.assertIn("You are now connected as @Alice", resp)
+        
+        server2.shutdown()
+        t2.join(timeout=1.0)
 
 if __name__ == '__main__':
     unittest.main()
