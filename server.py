@@ -117,15 +117,19 @@ class ClientSession:
             self.bytes_rx += len(data)
             self.buffer += data.decode("utf-8", errors="replace")
 
+            if len(self.buffer) > 65536:
+                print(f"[ERROR] Session '{self.nickname}' exceeded max buffer size. Disconnecting.")
+                break
+
             while "\n" in self.buffer:
                 line, self.buffer = self.buffer.split("\n", 1)
                 msg = line.strip(" \r\n\t")
                 if not msg:
                     continue
-                if self._handle_command(msg):
+                if self._process_message(msg):
                     return
 
-    def _handle_command(self, msg: str) -> bool:
+    def _process_message(self, msg: str) -> bool:
         if msg.startswith("/"):
             parts = msg.split(" ", 2)
             cmd = parts[0].lower()
@@ -212,8 +216,8 @@ class ClientSession:
 
 
 class ChatServer:
-    def __init__(self, config: ServerConfig = ServerConfig()):
-        self.config = config
+    def __init__(self, config: Optional[ServerConfig] = None):
+        self.config = config or ServerConfig()
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
@@ -235,10 +239,10 @@ class ChatServer:
             raise RuntimeError("Server is not bound to an address. Call start() first.")
         return self._bound_address
 
-    def _is_nickname_taken(self, nickname: str) -> bool:
+    def _is_nickname_taken(self, nickname: str, exclude: Optional[ClientSession] = None) -> bool:
         target = nickname.casefold()
         for session in self.sessions:
-            if session.nickname and session.nickname.casefold() == target:
+            if session != exclude and session.nickname and session.nickname.casefold() == target:
                 return True
         return False
 
@@ -256,7 +260,7 @@ class ChatServer:
 
     def change_nickname(self, session: ClientSession, new_nickname: str) -> bool:
         with self.registry_lock:
-            if self._is_nickname_taken(new_nickname):
+            if self._is_nickname_taken(new_nickname, exclude=session):
                 return False
             session.nickname = new_nickname
             return True
@@ -333,7 +337,10 @@ class ChatServer:
             
         for t in workers:
             if t != current_t:
-                t.join(timeout=2.0)
+                try:
+                    t.join(timeout=2.0)
+                except RuntimeError:
+                    pass
 
 
 def run_server():

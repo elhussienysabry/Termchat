@@ -7,15 +7,10 @@ import server
 
 class TestServerCharacterization(unittest.TestCase):
     def setUp(self):
-        # Find a free port
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        self.bound_port = s.getsockname()[1]
-        s.close()
-
-        config = server.ServerConfig(host="127.0.0.1", port=self.bound_port)
+        config = server.ServerConfig(host="127.0.0.1", port=0)
         self.chat_server = server.ChatServer(config)
         self.chat_server.start()
+        self.bound_port = self.chat_server.get_bound_address()[1]
         
         self.server_thread = threading.Thread(target=self.chat_server.serve_forever, daemon=True)
         self.server_thread.start()
@@ -125,9 +120,15 @@ class TestServerCharacterization(unittest.TestCase):
 
     def test_nick_command(self):
         c1 = self.create_client()
-        c1.sendall(b"Alice\n")
+        c1.sendall(b"alice\n")
         self._read_until(c1, "Start chatting!")
 
+        # Verify changing case for the same user succeeds
+        c1.sendall(b"/nick Alice\n")
+        resp = self._read_until(c1, "Nickname changed to @Alice")
+        self.assertIn("Nickname changed to @Alice", resp)
+
+        # Verify changing to a new nickname succeeds
         c1.sendall(b"/nick Alice_New\n")
         resp = self._read_until(c1, "Nickname changed to @Alice_New")
         self.assertIn("Nickname changed to @Alice_New", resp)
@@ -150,9 +151,9 @@ class TestServerCharacterization(unittest.TestCase):
         self.chat_server.shutdown()
         # Ensure we cannot connect anymore
         with self.assertRaises((ConnectionRefusedError, OSError)):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            sock.connect(("127.0.0.1", self.bound_port))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(("127.0.0.1", self.bound_port))
 
     def test_shutdown_closes_active_sessions(self):
         c1 = self.create_client()
