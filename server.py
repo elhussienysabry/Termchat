@@ -30,6 +30,17 @@ def broadcast(message: str, sender_sock: socket.socket = None):
         send_raw(s, message)
 
 
+def is_nickname_taken(nickname: str, exclude_sock: socket.socket = None) -> bool:
+    """Checks if a nickname is already in use (case-insensitive).
+    Must be called while holding clients_lock.
+    """
+    target = nickname.casefold()
+    for s, info in clients.items():
+        if s != exclude_sock and info.get("name", "").casefold() == target:
+            return True
+    return False
+
+
 def handle_client(sock: socket.socket, addr: tuple):
     """Handles an individual client connection session."""
     local_buffer = ""
@@ -56,25 +67,31 @@ def handle_client(sock: socket.socket, addr: tuple):
     # Initial handshake: get nickname
     try:
         while True:
-            data = sock.recv(1024)
-            if not data:
-                sock.close()
-                return
-            client_info["bytes_rx"] += len(data)
-            local_buffer += data.decode("utf-8", errors="replace")
+            while "\n" not in local_buffer:
+                data = sock.recv(1024)
+                if not data:
+                    sock.close()
+                    return
+                client_info["bytes_rx"] += len(data)
+                local_buffer += data.decode("utf-8", errors="replace")
 
-            if "\n" in local_buffer:
-                line, local_buffer = local_buffer.split("\n", 1)
-                chosen_name = line.strip(" \r\n\t")
-                if chosen_name:
-                    client_info["name"] = chosen_name.replace(" ", "_")
-                break
+            line, local_buffer = local_buffer.split("\n", 1)
+            chosen_name = line.strip(" \r\n\t")
+            candidate_name = chosen_name.replace(" ", "_") if chosen_name else client_info["name"]
+
+            with clients_lock:
+                if not is_nickname_taken(candidate_name):
+                    client_info["name"] = candidate_name
+                    clients[sock] = client_info
+                    break
+
+            send_raw(
+                sock,
+                f"[SERVER] Error: Nickname @{candidate_name} is already in use. Please enter a different nickname: ",
+            )
     except Exception:
         sock.close()
         return
-
-    with clients_lock:
-        clients[sock] = client_info
 
     name = client_info["name"]
     print(f"[JOIN] '{name}' connected from {addr} (Active: {len(clients)})")
@@ -126,13 +143,24 @@ def handle_client(sock: socket.socket, addr: tuple):
                             user_list = [f" - @{info['name']} ({info['addr'][0]}:{info['addr'][1]})" for info in clients.values()]
                         send_raw(sock, f"\r\n--- Online Users ({len(user_list)}) ---\r\n" + "\r\n".join(user_list) + "\r\n")
 
-                    elif cmd == "/nick" and len(parts) > 1:
-                        old_name = client_info["name"]
-                        new_name = parts[1].strip().replace(" ", "_")
-                        client_info["name"] = new_name
-                        name = new_name
-                        send_raw(sock, f"[SERVER] Nickname changed to @{new_name}\r\n")
-                        broadcast(f"*** [SERVER] @{old_name} is now known as @{new_name} ***", sender_sock=sock)
+                    elif cmd == "/nick":
+                        if len(parts) > 1 and parts[1].strip():
+                            new_name = parts[1].strip().replace(" ", "_")
+                            old_name = client_info["name"]
+                            success = False
+                            with clients_lock:
+                                if not is_nickname_taken(new_name, exclude_sock=sock):
+                                    client_info["name"] = new_name
+                                    name = new_name
+                                    success = True
+
+                            if success:
+                                send_raw(sock, f"[SERVER] Nickname changed to @{new_name}\r\n")
+                                broadcast(f"*** [SERVER] @{old_name} is now known as @{new_name} ***", sender_sock=sock)
+                            else:
+                                send_raw(sock, f"[SERVER] Error: Nickname @{new_name} is already in use.\r\n")
+                        else:
+                            send_raw(sock, "[SERVER] Usage: /nick <new_name>\r\n")
 
                     elif cmd in ("/msg", "/dm") and len(parts) > 2:
                         target_user = parts[1].lstrip("@")
@@ -140,7 +168,7 @@ def handle_client(sock: socket.socket, addr: tuple):
                         target_sock = None
                         with clients_lock:
                             for s, info in clients.items():
-                                if info["name"].lower() == target_user.lower():
+                                if info["name"].casefold() == target_user.casefold():
                                     target_sock = s
                                     break
                         if target_sock:
