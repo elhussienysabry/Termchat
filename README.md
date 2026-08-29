@@ -12,8 +12,9 @@ Connect using standard network utilities (**`telnet`**, **`nc` / `ncat`**) or th
 Termchat/
 |-- Images/
 |   `-- multichat.png       # Screenshot demo
-|-- server.py               # Multi-threaded TCP server with Telnet & command support
 |-- client.py               # Full-duplex Python terminal client
+|-- server.py               # Multi-threaded TCP server with Telnet & command support
+|-- LICENSE                 # Open-source MIT License
 `-- README.md               # Documentation
 ```
 
@@ -90,4 +91,13 @@ Once connected, you will be prompted to enter your nickname. You can chat normal
 
 4. **Graceful Connection Teardown**:
    - Detects `0 bytes` (`EOF`), `ConnectionResetError` (TCP RST), and broken pipes, cleanly pruning disconnected clients and notifying active room participants.
-# Termchat
+
+---
+
+## Project Scope & Contributing
+
+- **Educational & Portfolio Focus**: TermChat is primarily an educational and portfolio project focused on exploring socket programming and concurrency in Python.
+- **Scope & Future Enhancements**: While it is currently for educational purposes, enhancements and security improvements for broader use cases are welcome.
+- **Contributions**: External contributions, including bug-fix and enhancement pull requests, are greatly appreciated.
+- **License**: The project is open-source and licensed under the [MIT License](LICENSE).
+
