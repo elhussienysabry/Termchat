@@ -1,244 +1,368 @@
 import socket
 import threading
 import time
-from typing import Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Tuple, Set, List
 
-HOST = "0.0.0.0"  # Listen on all network interfaces
-PORT = 8890
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 8890
+    backlog: int = 128
+    recv_size: int = 1024
 
-# Registry mapping socket -> client state dict
-clients: Dict[socket.socket, Dict[str, Any]] = {}
-clients_lock = threading.Lock()
+class ClientSession:
+    def __init__(self, server: 'ChatServer', sock: socket.socket, addr: tuple):
+        self.server = server
+        self.sock = sock
+        self.addr = addr
+        self.nickname: Optional[str] = None
+        self.connected_at = time.time()
+        self.bytes_rx = 0
+        self.bytes_tx = 0
+        self.buffer = ""
+        self.registered = False
+        self.closed = False
+        self.send_lock = threading.Lock()
 
+    def send_raw(self, message: str):
+        if self.closed:
+            return
+        if not message.endswith("\r\n"):
+            message = message.rstrip("\r\n") + "\r\n"
+        encoded = message.encode("utf-8")
+        
+        with self.send_lock:
+            try:
+                self.sock.sendall(encoded)
+                self.bytes_tx += len(encoded)
+            except OSError:
+                pass
 
-def send_raw(sock: socket.socket, message: str):
-    """Sends text ensuring Telnet-compatible CRLF line endings."""
-    if not message.endswith("\r\n"):
-        message = message.rstrip("\r\n") + "\r\n"
-    try:
-        sock.sendall(message.encode("utf-8"))
-    except OSError:
-        pass
+    def run(self):
+        try:
+            if not self._handshake():
+                return
+            self._receive_loop()
+        except ConnectionResetError:
+            print(f"[RESET] '{self.nickname}' connection reset abruptly (TCP RST).")
+        except Exception as e:
+            print(f"[ERROR] Session error for '{self.nickname}': {e}")
+        finally:
+            self.cleanup()
 
+    def _handshake(self) -> bool:
+        banner = (
+            "\r\n"
+            "=====================================================\r\n"
+            "   Welcome to the TCP Terminal Chat Server!          \r\n"
+            "=====================================================\r\n"
+            " Commands: /help, /users, /nick <name>, /msg <u> <m>, /quit\r\n"
+            "-----------------------------------------------------\r\n"
+            "Enter your nickname: "
+        )
+        self.send_raw(banner)
 
-def broadcast(message: str, sender_sock: socket.socket = None):
-    """Broadcasts a message to all connected clients except sender."""
-    with clients_lock:
-        recipients = [s for s in clients if s != sender_sock]
-
-    for s in recipients:
-        send_raw(s, message)
-
-
-def is_nickname_taken(nickname: str, exclude_sock: socket.socket = None) -> bool:
-    """Checks if a nickname is already in use (case-insensitive).
-    Must be called while holding clients_lock.
-    """
-    target = nickname.casefold()
-    for s, info in clients.items():
-        if s != exclude_sock and info.get("name", "").casefold() == target:
-            return True
-    return False
-
-
-def handle_client(sock: socket.socket, addr: tuple):
-    """Handles an individual client connection session."""
-    local_buffer = ""
-    client_info = {
-        "name": f"User_{addr[1]}",
-        "addr": addr,
-        "connected_at": time.time(),
-        "bytes_rx": 0,
-        "bytes_tx": 0,
-    }
-
-    # Send Welcome Banner
-    banner = (
-        "\r\n"
-        "=====================================================\r\n"
-        "   Welcome to the TCP Terminal Chat Server!          \r\n"
-        "=====================================================\r\n"
-        " Commands: /help, /users, /nick <name>, /msg <u> <m>, /quit\r\n"
-        "-----------------------------------------------------\r\n"
-        "Enter your nickname: "
-    )
-    send_raw(sock, banner)
-
-    # Initial handshake: get nickname
-    try:
-        while True:
-            while "\n" not in local_buffer:
-                data = sock.recv(1024)
-                if not data:
-                    sock.close()
-                    return
-                client_info["bytes_rx"] += len(data)
-                local_buffer += data.decode("utf-8", errors="replace")
-
-            line, local_buffer = local_buffer.split("\n", 1)
-            chosen_name = line.strip(" \r\n\t")
-            candidate_name = chosen_name.replace(" ", "_") if chosen_name else client_info["name"]
-
-            with clients_lock:
-                if not is_nickname_taken(candidate_name):
-                    client_info["name"] = candidate_name
-                    clients[sock] = client_info
-                    break
-
-            send_raw(
-                sock,
-                f"[SERVER] Error: Nickname @{candidate_name} is already in use. Please enter a different nickname: ",
-            )
-    except Exception:
-        sock.close()
-        return
-
-    name = client_info["name"]
-    print(f"[JOIN] '{name}' connected from {addr} (Active: {len(clients)})")
-    send_raw(sock, f"\r\n[SERVER] You are now connected as @{name}. Start chatting!\r\n")
-    broadcast(f"*** [SERVER] @{name} has joined the chat room ***", sender_sock=sock)
-
-    # Main message processing loop
-    try:
-        while True:
-            data = sock.recv(1024)
+        while "\n" not in self.buffer:
+            try:
+                data = self.sock.recv(self.server.config.recv_size)
+            except OSError:
+                return False
             if not data:
-                # Client closed connection (TCP FIN received / EOF)
-                print(f"[LEAVE] '{name}' disconnected cleanly (EOF/FIN).")
+                return False
+            self.bytes_rx += len(data)
+            self.buffer += data.decode("utf-8", errors="replace")
+
+        line, self.buffer = self.buffer.split("\n", 1)
+        chosen_name = line.strip(" \r\n\t")
+        candidate_name = chosen_name.replace(" ", "_") if chosen_name else f"User_{self.addr[1]}"
+
+        while True:
+            if self.server.register_session(self, candidate_name):
+                self.registered = True
+                print(f"[JOIN] '{self.nickname}' connected from {self.addr} (Active: {self.server.active_count()})")
+                self.send_raw(f"\r\n[SERVER] You are now connected as @{self.nickname}. Start chatting!\r\n")
+                self.server.broadcast(f"*** [SERVER] @{self.nickname} has joined the chat room ***", exclude=self)
+                return True
+            
+            self.send_raw(
+                f"[SERVER] Error: Nickname @{candidate_name} is already in use. Please enter a different nickname: "
+            )
+            
+            while "\n" not in self.buffer:
+                try:
+                    data = self.sock.recv(self.server.config.recv_size)
+                except OSError:
+                    return False
+                if not data:
+                    return False
+                self.bytes_rx += len(data)
+                self.buffer += data.decode("utf-8", errors="replace")
+                
+            line, self.buffer = self.buffer.split("\n", 1)
+            chosen_name = line.strip(" \r\n\t")
+            candidate_name = chosen_name.replace(" ", "_") if chosen_name else f"User_{self.addr[1]}"
+
+    def _receive_loop(self):
+        while not self.server.shutdown_event.is_set() and not self.closed:
+            try:
+                data = self.sock.recv(self.server.config.recv_size)
+            except OSError:
+                break
+                
+            if not data:
+                print(f"[LEAVE] '{self.nickname}' disconnected cleanly (EOF/FIN).")
                 break
 
-            client_info["bytes_rx"] += len(data)
-            local_buffer += data.decode("utf-8", errors="replace")
+            self.bytes_rx += len(data)
+            self.buffer += data.decode("utf-8", errors="replace")
 
-            # Process all complete lines in buffer (Stream Framing)
-            while "\n" in local_buffer:
-                line, local_buffer = local_buffer.split("\n", 1)
+            if len(self.buffer) > 65536:
+                print(f"[ERROR] Session '{self.nickname}' exceeded max buffer size. Disconnecting.")
+                break
+
+            while "\n" in self.buffer:
+                line, self.buffer = self.buffer.split("\n", 1)
                 msg = line.strip(" \r\n\t")
                 if not msg:
                     continue
+                if self._process_message(msg):
+                    return
 
-                # Handle Commands
-                if msg.startswith("/"):
-                    parts = msg.split(" ", 2)
-                    cmd = parts[0].lower()
+    def _process_message(self, msg: str) -> bool:
+        if msg.startswith("/"):
+            parts = msg.split(" ", 2)
+            cmd = parts[0].lower()
 
-                    if cmd in ("/quit", "/exit"):
-                        send_raw(sock, "[SERVER] Goodbye!\r\n")
-                        return
+            if cmd in ("/quit", "/exit"):
+                self.send_raw("[SERVER] Goodbye!\r\n")
+                return True
 
-                    elif cmd == "/help":
-                        help_text = (
-                            "\r\n--- Available Commands ---\r\n"
-                            "  /help              - Show this menu\r\n"
-                            "  /users or /list    - List online users\r\n"
-                            "  /nick <new_name>   - Change your nickname\r\n"
-                            "  /msg <user> <text> - Send private DM\r\n"
-                            "  /stats             - View connection metrics\r\n"
-                            "  /quit or /exit     - Disconnect\r\n"
-                        )
-                        send_raw(sock, help_text)
+            elif cmd == "/help":
+                help_text = (
+                    "\r\n--- Available Commands ---\r\n"
+                    "  /help              - Show this menu\r\n"
+                    "  /users or /list    - List online users\r\n"
+                    "  /nick <new_name>   - Change your nickname\r\n"
+                    "  /msg <user> <text> - Send private DM\r\n"
+                    "  /stats             - View connection metrics\r\n"
+                    "  /quit or /exit     - Disconnect\r\n"
+                )
+                self.send_raw(help_text)
 
-                    elif cmd in ("/users", "/list"):
-                        with clients_lock:
-                            user_list = [f" - @{info['name']} ({info['addr'][0]}:{info['addr'][1]})" for info in clients.values()]
-                        send_raw(sock, f"\r\n--- Online Users ({len(user_list)}) ---\r\n" + "\r\n".join(user_list) + "\r\n")
+            elif cmd in ("/users", "/list"):
+                users = self.server.get_all_users()
+                user_list = [f" - @{u.nickname} ({u.addr[0]}:{u.addr[1]})" for u in users]
+                self.send_raw(f"\r\n--- Online Users ({len(user_list)}) ---\r\n" + "\r\n".join(user_list) + "\r\n")
 
-                    elif cmd == "/nick":
-                        if len(parts) > 1 and parts[1].strip():
-                            new_name = parts[1].strip().replace(" ", "_")
-                            old_name = client_info["name"]
-                            success = False
-                            with clients_lock:
-                                if not is_nickname_taken(new_name, exclude_sock=sock):
-                                    client_info["name"] = new_name
-                                    name = new_name
-                                    success = True
-
-                            if success:
-                                send_raw(sock, f"[SERVER] Nickname changed to @{new_name}\r\n")
-                                broadcast(f"*** [SERVER] @{old_name} is now known as @{new_name} ***", sender_sock=sock)
-                            else:
-                                send_raw(sock, f"[SERVER] Error: Nickname @{new_name} is already in use.\r\n")
-                        else:
-                            send_raw(sock, "[SERVER] Usage: /nick <new_name>\r\n")
-
-                    elif cmd in ("/msg", "/dm") and len(parts) > 2:
-                        target_user = parts[1].lstrip("@")
-                        dm_text = parts[2]
-                        target_sock = None
-                        with clients_lock:
-                            for s, info in clients.items():
-                                if info["name"].casefold() == target_user.casefold():
-                                    target_sock = s
-                                    break
-                        if target_sock:
-                            send_raw(target_sock, f"[DM from @{name}]: {dm_text}")
-                            send_raw(sock, f"[DM to @{target_user}]: {dm_text}")
-                        else:
-                            send_raw(sock, f"[SERVER] User @{target_user} not found.")
-
-                    elif cmd == "/stats":
-                        uptime = time.time() - client_info["connected_at"]
-                        stats_msg = (
-                            f"\r\n--- TCP Connection Stats ---\r\n"
-                            f"  Endpoint: {addr[0]}:{addr[1]}\r\n"
-                            f"  Uptime:   {uptime:.1f} seconds\r\n"
-                            f"  RX Bytes: {client_info['bytes_rx']} bytes\r\n"
-                        )
-                        send_raw(sock, stats_msg)
+            elif cmd == "/nick":
+                if len(parts) > 1 and parts[1].strip():
+                    new_name = parts[1].strip().replace(" ", "_")
+                    old_name = self.nickname
+                    if self.server.change_nickname(self, new_name):
+                        self.send_raw(f"[SERVER] Nickname changed to @{new_name}\r\n")
+                        self.server.broadcast(f"*** [SERVER] @{old_name} is now known as @{new_name} ***", exclude=self)
                     else:
-                        send_raw(sock, f"[SERVER] Unknown command '{cmd}'. Type /help for assistance.")
+                        self.send_raw(f"[SERVER] Error: Nickname @{new_name} is already in use.\r\n")
                 else:
-                    # Public broadcast message
-                    print(f"[CHAT] @{name}: {msg}")
-                    broadcast(f"[@{name}]: {msg}", sender_sock=sock)
+                    self.send_raw("[SERVER] Usage: /nick <new_name>\r\n")
 
-    except ConnectionResetError:
-        print(f"[RESET] '{name}' connection reset abruptly (TCP RST).")
-    except Exception as e:
-        print(f"[ERROR] Session error for '{name}': {e}")
-    finally:
-        with clients_lock:
-            clients.pop(sock, None)
-            remaining = len(clients)
+            elif cmd in ("/msg", "/dm") and len(parts) > 2:
+                target_user = parts[1].lstrip("@")
+                dm_text = parts[2]
+                target_session = self.server.get_user_by_nickname(target_user)
+                if target_session:
+                    target_session.send_raw(f"[DM from @{self.nickname}]: {dm_text}")
+                    self.send_raw(f"[DM to @{target_user}]: {dm_text}")
+                else:
+                    self.send_raw(f"[SERVER] User @{target_user} not found.")
 
+            elif cmd == "/stats":
+                uptime = time.time() - self.connected_at
+                stats_msg = (
+                    f"\r\n--- TCP Connection Stats ---\r\n"
+                    f"  Endpoint: {self.addr[0]}:{self.addr[1]}\r\n"
+                    f"  Uptime:   {uptime:.1f} seconds\r\n"
+                    f"  RX Bytes: {self.bytes_rx} bytes\r\n"
+                )
+                self.send_raw(stats_msg)
+            else:
+                self.send_raw(f"[SERVER] Unknown command '{cmd}'. Type /help for assistance.")
+        else:
+            print(f"[CHAT] @{self.nickname}: {msg}")
+            self.server.broadcast(f"[@{self.nickname}]: {msg}", exclude=self)
+        return False
+
+    def cleanup(self):
+        if self.closed:
+            return
+        self.closed = True
+        
         try:
-            sock.close()
+            self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
-        print(f"[DISCONNECT] Closed socket for '{name}'. Remaining active: {remaining}")
-        broadcast(f"*** [SERVER] @{name} left the chat room ***")
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+        if self.registered:
+            self.server.unregister_session(self)
+            self.registered = False
+            print(f"[DISCONNECT] Closed socket for '{self.nickname}'. Remaining active: {self.server.active_count()}")
+            self.server.broadcast(f"*** [SERVER] @{self.nickname} left the chat room ***")
+
+
+class ChatServer:
+    def __init__(self, config: Optional[ServerConfig] = None):
+        self.config = config or ServerConfig()
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        self.sessions: Set[ClientSession] = set()
+        self.registry_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+        
+        self.worker_threads: Set[threading.Thread] = set()
+        self.worker_lock = threading.Lock()
+        self._bound_address: Optional[Tuple[str, int]] = None
+
+    def start(self):
+        self.server_sock.bind((self.config.host, self.config.port))
+        self.server_sock.listen(self.config.backlog)
+        self._bound_address = self.server_sock.getsockname()
+
+    def get_bound_address(self) -> Tuple[str, int]:
+        if not self._bound_address:
+            raise RuntimeError("Server is not bound to an address. Call start() first.")
+        return self._bound_address
+
+    def _is_nickname_taken(self, nickname: str, exclude: Optional[ClientSession] = None) -> bool:
+        target = nickname.casefold()
+        for session in self.sessions:
+            if session != exclude and session.nickname and session.nickname.casefold() == target:
+                return True
+        return False
+
+    def register_session(self, session: ClientSession, nickname: str) -> bool:
+        with self.registry_lock:
+            if self._is_nickname_taken(nickname):
+                return False
+            session.nickname = nickname
+            self.sessions.add(session)
+            return True
+
+    def unregister_session(self, session: ClientSession):
+        with self.registry_lock:
+            self.sessions.discard(session)
+
+    def change_nickname(self, session: ClientSession, new_nickname: str) -> bool:
+        with self.registry_lock:
+            if self._is_nickname_taken(new_nickname, exclude=session):
+                return False
+            session.nickname = new_nickname
+            return True
+
+    def active_count(self) -> int:
+        with self.registry_lock:
+            return len(self.sessions)
+
+    def get_all_users(self) -> List[ClientSession]:
+        with self.registry_lock:
+            return list(self.sessions)
+
+    def get_user_by_nickname(self, nickname: str) -> Optional[ClientSession]:
+        target = nickname.casefold()
+        with self.registry_lock:
+            for s in self.sessions:
+                if s.nickname and s.nickname.casefold() == target:
+                    return s
+        return None
+
+    def broadcast(self, message: str, exclude: Optional[ClientSession] = None):
+        with self.registry_lock:
+            recipients = [s for s in self.sessions if s != exclude]
+        for s in recipients:
+            s.send_raw(message)
+
+    def _run_worker(self, session: ClientSession):
+        try:
+            session.run()
+        finally:
+            with self.worker_lock:
+                self.worker_threads.discard(threading.current_thread())
+
+    def serve_forever(self):
+        try:
+            while not self.shutdown_event.is_set():
+                try:
+                    client_sock, client_addr = self.server_sock.accept()
+                except OSError:
+                    break
+                    
+                session = ClientSession(self, client_sock, client_addr)
+                t = threading.Thread(target=self._run_worker, args=(session,), daemon=True)
+                
+                with self.worker_lock:
+                    if self.shutdown_event.is_set():
+                        client_sock.close()
+                        break
+                    self.worker_threads.add(t)
+                    
+                t.start()
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        if self.shutdown_event.is_set():
+            return
+        self.shutdown_event.set()
+        
+        try:
+            self.server_sock.close()
+        except OSError:
+            pass
+
+        with self.registry_lock:
+            sessions_to_close = list(self.sessions)
+            
+        for s in sessions_to_close:
+            s.cleanup()
+
+        current_t = threading.current_thread()
+        with self.worker_lock:
+            workers = list(self.worker_threads)
+            
+        for t in workers:
+            if t != current_t:
+                try:
+                    t.join(timeout=2.0)
+                except RuntimeError:
+                    pass
 
 
 def run_server():
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, PORT))
-    server_sock.listen(128)
-
+    config = ServerConfig()
+    server = ChatServer(config)
+    server.start()
+    
+    port = server.get_bound_address()[1]
     print("=" * 65)
-    print(f" [TCP CHAT SERVER] Running on port {PORT}")
+    print(f" [TCP CHAT SERVER] Running on port {port}")
     print(" Connect via:")
-    print(f"   - Telnet:  telnet localhost {PORT}")
-    print(f"   - Netcat:  nc localhost {PORT}  (or ncat localhost {PORT})")
+    print(f"   - Telnet:  telnet localhost {port}")
+    print(f"   - Netcat:  nc localhost {port}  (or ncat localhost {port})")
     print("   - Python:  python3 client.py")
     print("=" * 65)
-
+    
     try:
-        while True:
-            client_sock, client_addr = server_sock.accept()
-            t = threading.Thread(
-                target=handle_client,
-                args=(client_sock, client_addr),
-                daemon=True,
-            )
-            t.start()
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down TCP Chat Server...")
     finally:
-        server_sock.close()
-
+        server.shutdown()
 
 if __name__ == "__main__":
     run_server()

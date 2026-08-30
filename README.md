@@ -94,6 +94,26 @@ Once connected, you will be prompted to enter your nickname. You can chat normal
 
 ---
 
+## Server Architecture
+
+TermChat uses a modular, object-oriented architecture designed for testing and extensibility:
+- **`ServerConfig`**: A typed configuration dataclass defining host, port, backlog, and network settings.
+- **`ChatServer`**: The core application server. Owns the listening socket, tracks worker threads, and manages the registry of connected sessions. It provides controlled lifecycle methods (`start`, `serve_forever`, `shutdown`) enabling reliable multi-instance testing in the same process.
+- **`ClientSession`**: Represents a single connected client. Encapsulates socket I/O, local buffering, nickname state, and command parsing.
+
+---
+
+## Running Tests
+
+Automated tests are included to verify the behavior, lifecycle, and network handling of the server. The tests automatically bind to ephemeral loopback ports, ensuring they don't conflict with active server instances.
+
+To run the test suite:
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+---
+
 ## Project Scope & Contributing
 
 - **Educational & Portfolio Focus**: TermChat is primarily an educational and portfolio project focused on exploring socket programming and concurrency in Python.
