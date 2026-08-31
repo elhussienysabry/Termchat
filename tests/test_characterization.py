@@ -203,5 +203,195 @@ class TestServerCharacterization(unittest.TestCase):
         server2.shutdown()
         t2.join(timeout=1.0)
 
+    def test_direct_message_aliases_and_at_stripping(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        c2 = self.create_client()
+        c2.sendall(b"Bob\n")
+        self._read_until(c2, "Start chatting!")
+
+        # /msg with leading @
+        c1.sendall(b"/msg @Bob hello alice here\n")
+        self.assertIn("[DM from @Alice]: hello alice here", self._read_until(c2, "[DM from @Alice]: hello alice here"))
+        self.assertIn("[DM to @Bob]: hello alice here", self._read_until(c1, "[DM to @Bob]: hello alice here"))
+
+        # /dm alias without @
+        c2.sendall(b"/dm Alice hey alice from bob\n")
+        self.assertIn("[DM from @Bob]: hey alice from bob", self._read_until(c1, "[DM from @Bob]: hey alice from bob"))
+        self.assertIn("[DM to @Alice]: hey alice from bob", self._read_until(c2, "[DM to @Alice]: hey alice from bob"))
+
+        # /w alias with @
+        c1.sendall(b"/w @Bob whisper message\n")
+        self.assertIn("[DM from @Alice]: whisper message", self._read_until(c2, "[DM from @Alice]: whisper message"))
+        self.assertIn("[DM to @Bob]: whisper message", self._read_until(c1, "[DM to @Bob]: whisper message"))
+
+    def test_direct_message_privacy_isolation(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        c2 = self.create_client()
+        c2.sendall(b"Bob\n")
+        self._read_until(c2, "Start chatting!")
+
+        c3 = self.create_client()
+        c3.sendall(b"Charlie\n")
+        self._read_until(c3, "Start chatting!")
+
+        self._read_until(c1, "@Charlie has joined")
+        self._read_until(c2, "@Charlie has joined")
+
+        # Alice sends private message to Bob
+        c1.sendall(b"/msg Bob top_secret_for_bob\n")
+        self._read_until(c2, "[DM from @Alice]: top_secret_for_bob")
+        self._read_until(c1, "[DM to @Bob]: top_secret_for_bob")
+
+        # Charlie should receive nothing related to the DM
+        c3.sendall(b"Charlie public probe\n")
+        self._read_until(c1, "[@Charlie]: Charlie public probe")
+        self._read_until(c2, "[@Charlie]: Charlie public probe")
+
+        c3.settimeout(0.2)
+        charlie_data = ""
+        try:
+            while True:
+                chunk = c3.recv(1024).decode('utf-8', errors='replace')
+                if not chunk:
+                    break
+                charlie_data += chunk
+        except socket.timeout:
+            pass
+
+        self.assertNotIn("top_secret_for_bob", charlie_data)
+
+    def test_direct_message_error_handling(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        # Target not found
+        c1.sendall(b"/msg Ghost hello\n")
+        resp = self._read_until(c1, "Error: User @Ghost not found or offline.")
+        self.assertIn("[SERVER] Error: User @Ghost not found or offline.", resp)
+
+        # Target not found with @
+        c1.sendall(b"/dm @Ghost hello\n")
+        resp = self._read_until(c1, "Error: User @Ghost not found or offline.")
+        self.assertIn("[SERVER] Error: User @Ghost not found or offline.", resp)
+
+        # Self-DM
+        c1.sendall(b"/msg Alice hello self\n")
+        resp = self._read_until(c1, "Error: You cannot send a direct message to yourself.")
+        self.assertIn("[SERVER] Error: You cannot send a direct message to yourself.", resp)
+
+        c1.sendall(b"/w @Alice hello self\n")
+        resp = self._read_until(c1, "Error: You cannot send a direct message to yourself.")
+        self.assertIn("[SERVER] Error: You cannot send a direct message to yourself.", resp)
+
+        # Empty usage
+        c1.sendall(b"/msg\n")
+        resp = self._read_until(c1, "Usage: /msg <username> <message>")
+        self.assertIn("[SERVER] Usage: /msg <username> <message>", resp)
+
+        c1.sendall(b"/dm Bob\n")
+        resp = self._read_until(c1, "Usage: /dm <username> <message>")
+        self.assertIn("[SERVER] Usage: /dm <username> <message>", resp)
+
+        c1.sendall(b"/w\n")
+        resp = self._read_until(c1, "Usage: /w <username> <message>")
+        self.assertIn("[SERVER] Usage: /w <username> <message>", resp)
+
+    def test_private_chat_mode_session_locking(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        c2 = self.create_client()
+        c2.sendall(b"Bob\n")
+        self._read_until(c2, "Start chatting!")
+
+        c3 = self.create_client()
+        c3.sendall(b"Charlie\n")
+        self._read_until(c3, "Start chatting!")
+
+        self._read_until(c1, "@Charlie has joined")
+        self._read_until(c2, "@Charlie has joined")
+
+        # Alice locks session into private chat mode with Bob
+        c1.sendall(b"/chat Bob\n")
+        resp = self._read_until(c1, "Entered private chat mode with @Bob")
+        self.assertIn("[SERVER] Entered private chat mode with @Bob", resp)
+
+        # Alice sends plain text (without /msg)
+        c1.sendall(b"Hey Bob this is private\n")
+        self.assertIn("[DM from @Alice]: Hey Bob this is private", self._read_until(c2, "[DM from @Alice]: Hey Bob this is private"))
+        self.assertIn("[DM to @Bob]: Hey Bob this is private", self._read_until(c1, "[DM to @Bob]: Hey Bob this is private"))
+
+        # Charlie should receive nothing
+        c3.settimeout(0.2)
+        charlie_data = ""
+        try:
+            while True:
+                chunk = c3.recv(1024).decode('utf-8', errors='replace')
+                if not chunk:
+                    break
+                charlie_data += chunk
+        except socket.timeout:
+            pass
+        self.assertNotIn("Hey Bob this is private", charlie_data)
+
+        # Switch back to public chat
+        c1.sendall(b"/chat all\n")
+        resp = self._read_until(c1, "Switched to public chat room.")
+        self.assertIn("[SERVER] Switched to public chat room.", resp)
+
+        # Alice sends public message
+        c1.sendall(b"Hello world everyone\n")
+        self.assertIn("[@Alice]: Hello world everyone", self._read_until(c2, "[@Alice]: Hello world everyone"))
+        self.assertIn("[@Alice]: Hello world everyone", self._read_until(c3, "[@Alice]: Hello world everyone"))
+
+    def test_private_chat_mode_edge_cases(self):
+        c1 = self.create_client()
+        c1.sendall(b"Alice\n")
+        self._read_until(c1, "Start chatting!")
+
+        c2 = self.create_client()
+        c2.sendall(b"Bob\n")
+        self._read_until(c2, "Start chatting!")
+
+        # Self-chat error
+        c1.sendall(b"/chat Alice\n")
+        resp = self._read_until(c1, "Error: You cannot start a private chat with yourself.")
+        self.assertIn("[SERVER] Error: You cannot start a private chat with yourself.", resp)
+
+        # Non-existent user
+        c1.sendall(b"/chat Ghost\n")
+        resp = self._read_until(c1, "Error: User @Ghost not found or offline.")
+        self.assertIn("[SERVER] Error: User @Ghost not found or offline.", resp)
+
+        # Usage
+        c1.sendall(b"/chat\n")
+        resp = self._read_until(c1, "Usage: /chat <username> | /chat all | /chat public")
+        self.assertIn("[SERVER] Usage: /chat <username> | /chat all | /chat public", resp)
+
+        # Already public
+        c1.sendall(b"/chat public\n")
+        resp = self._read_until(c1, "You are already in the public chat room.")
+        self.assertIn("[SERVER] You are already in the public chat room.", resp)
+
+        # Enter private chat mode with Bob, then Bob disconnects
+        c1.sendall(b"/chat @Bob\n")
+        self._read_until(c1, "Entered private chat mode with @Bob")
+
+        c2.close()
+        time.sleep(0.2)
+
+        # Alice sends message, should be notified Bob went offline and switched to public
+        c1.sendall(b"Are you still here?\n")
+        resp = self._read_until(c1, "Error: User @Bob not found or offline. Switched back to public chat room.")
+        self.assertIn("[SERVER] Error: User @Bob not found or offline. Switched back to public chat room.", resp)
+
 if __name__ == '__main__':
     unittest.main()
