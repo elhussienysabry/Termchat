@@ -101,16 +101,16 @@ Once connected, you will be prompted to enter your nickname. You can chat normal
 
 ## Server Architecture
 
-TermChat uses a modular, object-oriented architecture designed for testing and extensibility:
+TermChat uses a modular, object-oriented architecture designed for concurrency, testing, and extensibility:
 - **`ServerConfig`**: A typed configuration dataclass defining host, port, backlog, and network settings.
-- **`ChatServer`**: The core application server. Owns the listening socket, tracks worker threads, and manages the registry of connected sessions. It provides controlled lifecycle methods (`start`, `serve_forever`, `shutdown`) enabling reliable multi-instance testing in the same process.
-- **`ClientSession`**: Represents a single connected client. Encapsulates socket I/O, local buffering, nickname state, and command parsing.
+- **`ChatServer`**: The core application server. Owns the listening socket, manages active sessions (`ClientSession`), tracks worker threads, and coordinates graceful server shutdown. It provides synchronous lifecycle methods (`start`, `serve_forever`, `shutdown`) enabling reliable multi-instance testing and clean resource deallocation.
+- **`ClientSession`**: Encapsulates a connected client connection, handling thread-safe socket I/O, Telnet line buffering, private messaging states, and command dispatching.
 
 ---
 
 ## Running Tests
 
-Automated tests are included to verify the behavior, lifecycle, and network handling of the server. The tests automatically bind to ephemeral loopback ports, ensuring they don't conflict with active server instances.
+Automated characterization tests verify the full lifecycle, connection handling, command parsing, direct messaging isolation, and graceful shutdown of the server. Tests dynamically bind to ephemeral loopback ports (`port=0`), preventing port collision across parallel or rapid test runs.
 
 To run the test suite:
 ```bash
