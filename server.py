@@ -23,6 +23,7 @@ class ClientSession:
         self.buffer = ""
         self.registered = False
         self.closed = False
+        self.chat_target: Optional[str] = None
         self.send_lock = threading.Lock()
 
     def send_raw(self, message: str):
@@ -57,7 +58,7 @@ class ClientSession:
             "=====================================================\r\n"
             "   Welcome to the TCP Terminal Chat Server!          \r\n"
             "=====================================================\r\n"
-            " Commands: /help, /users, /nick <name>, /msg <u> <m>, /quit\r\n"
+            " Commands: /help, /users, /nick <name>, /msg <u> <m>, /chat <u>, /quit\r\n"
             "-----------------------------------------------------\r\n"
             "Enter your nickname: "
         )
@@ -131,7 +132,7 @@ class ClientSession:
 
     def _process_message(self, msg: str) -> bool:
         if msg.startswith("/"):
-            parts = msg.split(" ", 2)
+            parts = msg.split(maxsplit=2)
             cmd = parts[0].lower()
 
             if cmd in ("/quit", "/exit"):
@@ -141,12 +142,13 @@ class ClientSession:
             elif cmd == "/help":
                 help_text = (
                     "\r\n--- Available Commands ---\r\n"
-                    "  /help              - Show this menu\r\n"
-                    "  /users or /list    - List online users\r\n"
-                    "  /nick <new_name>   - Change your nickname\r\n"
-                    "  /msg <user> <text> - Send private DM\r\n"
-                    "  /stats             - View connection metrics\r\n"
-                    "  /quit or /exit     - Disconnect\r\n"
+                    "  /help                 - Show this menu\r\n"
+                    "  /users or /list       - List online users\r\n"
+                    "  /nick <new_name>      - Change your nickname\r\n"
+                    "  /msg <user> <message> - Send private DM (aliases: /dm, /w)\r\n"
+                    "  /chat <user|all>      - Enter private chat mode or switch to public\r\n"
+                    "  /stats                - View connection metrics\r\n"
+                    "  /quit or /exit        - Disconnect\r\n"
                 )
                 self.send_raw(help_text)
 
@@ -156,8 +158,9 @@ class ClientSession:
                 self.send_raw(f"\r\n--- Online Users ({len(user_list)}) ---\r\n" + "\r\n".join(user_list) + "\r\n")
 
             elif cmd == "/nick":
-                if len(parts) > 1 and parts[1].strip():
-                    new_name = parts[1].strip().replace(" ", "_")
+                nick_parts = msg.split(maxsplit=1)
+                if len(nick_parts) > 1 and nick_parts[1].strip():
+                    new_name = nick_parts[1].strip().replace(" ", "_")
                     old_name = self.nickname
                     if self.server.change_nickname(self, new_name):
                         self.send_raw(f"[SERVER] Nickname changed to @{new_name}\r\n")
@@ -167,15 +170,49 @@ class ClientSession:
                 else:
                     self.send_raw("[SERVER] Usage: /nick <new_name>\r\n")
 
-            elif cmd in ("/msg", "/dm") and len(parts) > 2:
-                target_user = parts[1].lstrip("@")
-                dm_text = parts[2]
-                target_session = self.server.get_user_by_nickname(target_user)
-                if target_session:
-                    target_session.send_raw(f"[DM from @{self.nickname}]: {dm_text}")
-                    self.send_raw(f"[DM to @{target_user}]: {dm_text}")
+            elif cmd in ("/msg", "/dm", "/w"):
+                if len(parts) < 3:
+                    self.send_raw(f"[SERVER] Usage: {cmd} <username> <message>\r\n")
                 else:
-                    self.send_raw(f"[SERVER] User @{target_user} not found.")
+                    target_user = parts[1].lstrip("@").strip()
+                    dm_text = parts[2].strip()
+                    if not target_user or not dm_text:
+                        self.send_raw(f"[SERVER] Usage: {cmd} <username> <message>\r\n")
+                    elif target_user.casefold() == (self.nickname.casefold() if self.nickname else ""):
+                        self.send_raw("[SERVER] Error: You cannot send a direct message to yourself.\r\n")
+                    else:
+                        target_session = self.server.get_user_by_nickname(target_user)
+                        if target_session:
+                            target_session.send_raw(f"[DM from @{self.nickname}]: {dm_text}")
+                            self.send_raw(f"[DM to @{target_session.nickname}]: {dm_text}")
+                        else:
+                            self.send_raw(f"[SERVER] Error: User @{target_user} not found or offline.\r\n")
+
+            elif cmd == "/chat":
+                chat_parts = msg.split(maxsplit=1)
+                if len(chat_parts) < 2 or not chat_parts[1].strip():
+                    self.send_raw("[SERVER] Usage: /chat <username> | /chat all | /chat public\r\n")
+                else:
+                    arg = chat_parts[1].strip().lstrip("@")
+                    if arg.lower() in ("all", "public"):
+                        if self.chat_target is None:
+                            self.send_raw("[SERVER] You are already in the public chat room.\r\n")
+                        else:
+                            self.chat_target = None
+                            self.send_raw("[SERVER] Switched to public chat room.\r\n")
+                    elif arg.casefold() == (self.nickname.casefold() if self.nickname else ""):
+                        self.send_raw("[SERVER] Error: You cannot start a private chat with yourself.\r\n")
+                    else:
+                        target_session = self.server.get_user_by_nickname(arg)
+                        if target_session:
+                            self.chat_target = target_session.nickname
+                            self.send_raw(
+                                f"[SERVER] Entered private chat mode with @{target_session.nickname}. "
+                                "Type '/chat all' or '/chat public' to return to public chat.\r\n"
+                            )
+                        else:
+                            self.chat_target = None
+                            self.send_raw(f"[SERVER] Error: User @{arg} not found or offline.\r\n")
 
             elif cmd == "/stats":
                 uptime = time.time() - self.connected_at
@@ -187,16 +224,30 @@ class ClientSession:
                 )
                 self.send_raw(stats_msg)
             else:
-                self.send_raw(f"[SERVER] Unknown command '{cmd}'. Type /help for assistance.")
+                self.send_raw(f"[SERVER] Unknown command '{cmd}'. Type /help for assistance.\r\n")
         else:
-            print(f"[CHAT] @{self.nickname}: {msg}")
-            self.server.broadcast(f"[@{self.nickname}]: {msg}", exclude=self)
+            if self.chat_target:
+                target_session = self.server.get_user_by_nickname(self.chat_target)
+                if target_session:
+                    target_session.send_raw(f"[DM from @{self.nickname}]: {msg}")
+                    self.send_raw(f"[DM to @{target_session.nickname}]: {msg}")
+                else:
+                    stale_target = self.chat_target
+                    self.chat_target = None
+                    self.send_raw(
+                        f"[SERVER] Error: User @{stale_target} not found or offline. "
+                        "Switched back to public chat room.\r\n"
+                    )
+            else:
+                print(f"[CHAT] @{self.nickname}: {msg}")
+                self.server.broadcast(f"[@{self.nickname}]: {msg}", exclude=self)
         return False
 
     def cleanup(self):
         if self.closed:
             return
         self.closed = True
+        self.chat_target = None
         
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
