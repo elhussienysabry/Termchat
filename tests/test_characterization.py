@@ -14,23 +14,6 @@ class TestServerCharacterization(unittest.TestCase):
         
         self.server_thread = threading.Thread(target=self.chat_server.serve_forever, daemon=True)
         self.server_thread.start()
-        
-        # Wait for server to start listening by trying to connect
-        connected = False
-        timeout = time.time() + 2
-        while not connected and time.time() < timeout:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.1)
-                s.connect(("127.0.0.1", self.bound_port))
-                s.close()
-                connected = True
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.05)
-                
-        if not connected:
-            self.fail("Server did not bind to a port within timeout")
-
         self.client_sockets = []
 
     def tearDown(self):
@@ -171,15 +154,10 @@ class TestServerCharacterization(unittest.TestCase):
         self.chat_server.shutdown() # Should not raise
 
     def test_multiple_independent_servers(self):
-        # find another port
-        s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s2.bind(("127.0.0.1", 0))
-        port2 = s2.getsockname()[1]
-        s2.close()
-
-        config2 = server.ServerConfig(host="127.0.0.1", port=port2)
+        config2 = server.ServerConfig(host="127.0.0.1", port=0)
         server2 = server.ChatServer(config2)
         server2.start()
+        port2 = server2.get_bound_address()[1]
         
         t2 = threading.Thread(target=server2.serve_forever, daemon=True)
         t2.start()

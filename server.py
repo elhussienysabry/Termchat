@@ -244,26 +244,30 @@ class ClientSession:
         return False
 
     def cleanup(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.chat_target = None
+        with self.send_lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.chat_target = None
+            was_registered = self.registered
+            self.registered = False
+            nick = self.nickname
+            sock = self.sock
         
         try:
-            self.sock.shutdown(socket.SHUT_RDWR)
+            sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
         try:
-            self.sock.close()
+            sock.close()
         except OSError:
             pass
 
-        if self.registered:
+        if was_registered:
             self.server.unregister_session(self)
-            self.registered = False
-            print(f"[DISCONNECT] Closed socket for '{self.nickname}'. Remaining active: {self.server.active_count()}")
-            self.server.broadcast(f"*** [SERVER] @{self.nickname} left the chat room ***")
+            print(f"[DISCONNECT] Closed socket for '{nick}'. Remaining active: {self.server.active_count()}")
+            self.server.broadcast(f"*** [SERVER] @{nick} left the chat room ***")
 
 
 class ChatServer:
@@ -273,12 +277,14 @@ class ChatServer:
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         self.sessions: Set[ClientSession] = set()
+        self.all_sessions: Set[ClientSession] = set()
         self.registry_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         
         self.worker_threads: Set[threading.Thread] = set()
         self.worker_lock = threading.Lock()
         self._bound_address: Optional[Tuple[str, int]] = None
+        self._server_thread: Optional[threading.Thread] = None
 
     def start(self):
         self.server_sock.bind((self.config.host, self.config.port))
@@ -339,20 +345,29 @@ class ChatServer:
             s.send_raw(message)
 
     def _run_worker(self, session: ClientSession):
+        with self.registry_lock:
+            self.all_sessions.add(session)
         try:
             session.run()
         finally:
+            with self.registry_lock:
+                self.all_sessions.discard(session)
             with self.worker_lock:
                 self.worker_threads.discard(threading.current_thread())
 
     def serve_forever(self):
+        self._server_thread = threading.current_thread()
+        self.server_sock.settimeout(0.2)
         try:
             while not self.shutdown_event.is_set():
                 try:
                     client_sock, client_addr = self.server_sock.accept()
+                except (socket.timeout, TimeoutError):
+                    continue
                 except OSError:
                     break
                     
+                client_sock.settimeout(None)
                 session = ClientSession(self, client_sock, client_addr)
                 t = threading.Thread(target=self._run_worker, args=(session,), daemon=True)
                 
@@ -371,18 +386,37 @@ class ChatServer:
             return
         self.shutdown_event.set()
         
+        if self._bound_address:
+            try:
+                host, port = self._bound_address
+                if host == "0.0.0.0":
+                    host = "127.0.0.1"
+                elif host == "::":
+                    host = "::1"
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as trigger:
+                    trigger.settimeout(0.1)
+                    trigger.connect((host, port))
+            except OSError:
+                pass
+
         try:
             self.server_sock.close()
         except OSError:
             pass
 
         with self.registry_lock:
-            sessions_to_close = list(self.sessions)
+            sessions_to_close = list(self.all_sessions)
             
         for s in sessions_to_close:
             s.cleanup()
 
         current_t = threading.current_thread()
+        if self._server_thread and self._server_thread != current_t:
+            try:
+                self._server_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+
         with self.worker_lock:
             workers = list(self.worker_threads)
             
