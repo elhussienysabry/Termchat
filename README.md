@@ -70,7 +70,8 @@ Once connected, you will be prompted to enter your nickname. You can chat normal
 | `/help` | **Show Help** | Displays the list of available commands. |
 | `/users` or `/list` | **List Online Users** | Shows all currently connected clients and their `IP:Port` 4-tuple endpoints. |
 | `/nick <new_name>` | **Change Nickname** | Updates your display name and broadcasts the change to everyone. |
-| `/msg <user> <message>` | **Private Direct Message** | Sends a private DM to a specific user (e.g. `/msg Bob Hello!`). |
+| `/msg <user> <message>` | **Private Direct Message** | Sends a private DM to a specific user (aliases: `/dm`, `/w`). Strips leading `@` (e.g. `/msg @Bob hello`). |
+| `/chat <user\|all>` | **Private Chat Mode** | Enters 1-to-1 private chat session with a user or switches back to public room (`/chat all` or `/chat public`). |
 | `/stats` | **Connection Metrics** | Shows your connection uptime, total bytes received (RX), and local socket endpoint. |
 | `/quit` or `/exit` | **Clean Disconnect** | Sends a goodbye message and closes your TCP connection. |
 
