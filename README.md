@@ -123,6 +123,6 @@ python3 -m unittest discover -s tests -v
 
 - **Educational & Portfolio Focus**: TermChat is primarily an educational and portfolio project focused on exploring socket programming and concurrency in Python.
 - **AI Pair Programming & Collaboration**: Built and refined with AI pair programming assistance across architecture design, test characterization, and concurrency debugging.
-- **Contributions**: External contributions, including bug-fix and enhancement pull requests, are greatly appreciated.
+- **Contributions**: External contributions, including bug-fix and enhancement pull requests, are greatly appreciated. See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, test commands, and pull request guidelines.
 - **License**: The project is open-source and licensed under the [MIT License](LICENSE).
 
